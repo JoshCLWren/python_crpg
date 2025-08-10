@@ -4,6 +4,8 @@ import sys
 from typing import Tuple
 
 import pygame
+import math
+import random
 
 from .dungeon import Dungeon
 import os
@@ -27,8 +29,9 @@ class EOBViewPG:
         self.font_large = pygame.font.Font(None, 28)
 
         # Layer margins similar to Tk view
-        self.margins_x = [40, 140, 220, 280]
-        self.margins_y = [40, 110, 160, 200]
+        # Bring near layer to screen edges to avoid visible border
+        self.margins_x = [0, 140, 220, 280]
+        self.margins_y = [0, 110, 160, 200]
 
         # Palette
         self.color_bg = (10, 10, 12)
@@ -65,6 +68,16 @@ class EOBViewPG:
 
         # Map state
         self.map_open = False
+
+        # --- Procedural textures (no external deps) ---
+        self._tile_size = 64
+        self._rng = random.Random(1337)
+        self.tile_floor = self._gen_floor_tile(self._tile_size)
+        self.tile_ceiling = self._gen_ceiling_tile(self._tile_size)
+        base_wall = self._gen_brick_tile(self._tile_size)
+        # Pre-tint 4 depth variants to mirror existing palette steps
+        depth_factors = [0.70, 0.80, 0.92, 1.0]
+        self.wall_tiles = [self._tint_surface(base_wall, f) for f in depth_factors]
 
     # ----------------- Mainloop -----------------
     def run(self) -> None:
@@ -121,27 +134,32 @@ class EOBViewPG:
         if self.map_open:
             self._draw_map()
         else:
-            # Ceiling and floor
-            pygame.draw.rect(s, self.color_ceiling, pygame.Rect(0, 0, W, H // 2))
-            pygame.draw.rect(s, self.color_floor, pygame.Rect(0, H // 2, W, H // 2))
+            # Ceiling and floor with subtle torch flicker brightness
+            flicker = self._flicker()
+            self._blit_tiled(self.tile_ceiling, pygame.Rect(0, 0, W, H // 2), brightness=flicker)
+            self._blit_tiled(self.tile_floor, pygame.Rect(0, H // 2, W, H // 2), brightness=flicker)
 
             # Draw far to near layers
             for d in reversed(range(4)):
                 fx1, fy1, fx2, fy2 = self._front_rect(d)
                 wx, wy = self.dungeon.transform_local(d + 1, 0)
-                if self.dungeon.is_wall(wx, wy):
-                    self._rect_with_outline((fx1, fy1, fx2 - fx1, fy2 - fy1), self._wall_color(d))
-                    continue
+                front_is_wall = self.dungeon.is_wall(wx, wy)
 
                 if d < 3:
-                    # Left side wall
+                    # Side walls for this depth, even if front is a wall
                     lx, ly = self.dungeon.transform_local(d + 1, -1)
                     if self.dungeon.is_wall(lx, ly):
                         self._side_wall(d, left=True)
-                    # Right side wall
                     rx, ry = self.dungeon.transform_local(d + 1, 1)
                     if self.dungeon.is_wall(rx, ry):
                         self._side_wall(d, left=False)
+
+                if front_is_wall:
+                    # Draw front-facing wall after side walls for correct overlap
+                    rect = pygame.Rect(fx1, fy1, fx2 - fx1, fy2 - fy1)
+                    self._blit_tiled(self.wall_tiles[d], rect)
+                    pygame.draw.rect(s, self.color_outline, rect, width=2)
+                    continue
 
         # HUD
         p = self.dungeon.player
@@ -254,7 +272,8 @@ class EOBViewPG:
                 (W - mx1, H - my1),
                 (W - mx1, my1),
             ]
-        pygame.draw.polygon(self.screen, self._wall_color(d), poly)
+        # Texture-map side wall by tiling and masking to polygon
+        self._blit_tiled_polygon(self.wall_tiles[d], poly)
         pygame.draw.polygon(self.screen, self.color_outline, poly, width=2)
 
     # ----------------- UI Helpers -----------------
@@ -313,3 +332,164 @@ class EOBViewPG:
             self._toast("Game loaded.")
         except Exception as e:
             self._toast(f"Load failed: {e}")
+
+    # ----------------- Texture helpers -----------------
+    def _randf(self, a: float, b: float) -> float:
+        return self._rng.uniform(a, b)
+
+    def _gen_floor_tile(self, sz: int) -> pygame.Surface:
+        # Checker base with noise speckle and soft vignette
+        surf = pygame.Surface((sz, sz)).convert()
+        c1 = (45, 45, 52)
+        c2 = (50, 50, 58)
+        cell = sz // 8 or 8
+        for y in range(0, sz, cell):
+            for x in range(0, sz, cell):
+                r = ((x // cell) + (y // cell)) % 2
+                color = c1 if r == 0 else c2
+                pygame.draw.rect(surf, color, (x, y, cell, cell))
+        # Speckle
+        arr = pygame.PixelArray(surf)
+        for _ in range(sz * 16):
+            x = self._rng.randrange(0, sz)
+            y = self._rng.randrange(0, sz)
+            shade = self._rng.randrange(-6, 7)
+            col = surf.unmap_rgb(arr[x, y])
+            r, g, b = col.r, col.g, col.b
+            nr, ng, nb = max(0, min(255, r + shade)), max(0, min(255, g + shade)), max(0, min(255, b + shade))
+            arr[x, y] = surf.map_rgb((nr, ng, nb))
+        del arr
+        return surf.convert()
+
+    def _gen_ceiling_tile(self, sz: int) -> pygame.Surface:
+        # Soft vertical gradient with subtle noise
+        surf = pygame.Surface((sz, sz)).convert()
+        top = self.color_ceiling
+        bot = (max(0, top[0] - 6), max(0, top[1] - 6), max(0, top[2] - 6))
+        for y in range(sz):
+            t = y / (sz - 1)
+            r = int(top[0] * (1 - t) + bot[0] * t)
+            g = int(top[1] * (1 - t) + bot[1] * t)
+            b = int(top[2] * (1 - t) + bot[2] * t)
+            pygame.draw.line(surf, (r, g, b), (0, y), (sz, y))
+        # Speckle
+        arr = pygame.PixelArray(surf)
+        for _ in range(sz * 8):
+            x = self._rng.randrange(0, sz)
+            y = self._rng.randrange(0, sz)
+            shade = self._rng.randrange(-4, 5)
+            col = surf.unmap_rgb(arr[x, y])
+            r, g, b = col.r, col.g, col.b
+            arr[x, y] = surf.map_rgb((max(0, min(255, r + shade)), max(0, min(255, g + shade)), max(0, min(255, b + shade))))
+        del arr
+        return surf.convert()
+
+    def _gen_brick_tile(self, sz: int) -> pygame.Surface:
+        surf = pygame.Surface((sz, sz)).convert()
+        base = (95, 96, 108)
+        mortar = (58, 58, 66)
+        surf.fill(base)
+        # Brick layout (rows with offset)
+        rows = 6
+        brick_h = sz // rows
+        mortar_t = max(1, brick_h // 10)
+        for row in range(rows):
+            y0 = row * brick_h
+            # horizontal mortar
+            pygame.draw.rect(surf, mortar, (0, y0, sz, mortar_t))
+            # bricks per row
+            offset = (row % 2) * (sz // 6)
+            brick_w = sz // 3
+            for col in range(-1, 4):
+                x0 = col * brick_w + offset
+                # vertical mortar
+                pygame.draw.rect(surf, mortar, (x0, y0, mortar_t, brick_h))
+        # Subtle per-pixel variation
+        arr = pygame.PixelArray(surf)
+        for y in range(sz):
+            for x in range(sz):
+                if self._rng.random() < 0.06:
+                    shade = self._rng.randrange(-10, 11)
+                    col = surf.unmap_rgb(arr[x, y])
+                    r, g, b = col.r, col.g, col.b
+                    arr[x, y] = surf.map_rgb((max(0, min(255, r + shade)), max(0, min(255, g + shade)), max(0, min(255, b + shade))))
+        del arr
+        return surf.convert()
+
+    def _tint_surface(self, src: pygame.Surface, factor: float) -> pygame.Surface:
+        # Multiply brightness by factor using a copy
+        surf = src.copy().convert()
+        # Create a solid color surface and blend multiply-ish using special_flags
+        tint = pygame.Surface(surf.get_size()).convert()
+        val = max(0, min(255, int(255 * factor)))
+        tint.fill((val, val, val))
+        surf.blit(tint, (0, 0), special_flags=pygame.BLEND_MULT)
+        return surf
+
+    def _blit_tiled(self, tile: pygame.Surface, rect: pygame.Rect, *, brightness: float = 1.0) -> None:
+        # Optionally apply brightness by blitting a tinted copy once per call
+        if brightness != 1.0:
+            tile = self._tint_surface(tile, brightness)
+        ts = tile.get_size()
+        x0, y0, w, h = rect
+        prev_clip = self.screen.get_clip()
+        self.screen.set_clip(rect)
+        try:
+            for y in range(y0, y0 + h, ts[1]):
+                for x in range(x0, x0 + w, ts[0]):
+                    self.screen.blit(tile, (x, y))
+        finally:
+            self.screen.set_clip(prev_clip)
+
+    def _flicker(self) -> float:
+        # Smooth flicker from combined sines
+        t = pygame.time.get_ticks() / 1000.0
+        v = 0.5 * (math.sin(t * 2.1) + math.sin(t * 2.7 + 1.3))
+        return 0.96 + 0.06 * v  # ~0.90..1.02
+
+    def _poly_hatch(self, poly: list[tuple[int, int]], intensity: int = 24) -> None:
+        # Draw faint vertical stripes clipped to polygon
+        if not poly:
+            return
+        min_x = min(p[0] for p in poly)
+        max_x = max(p[0] for p in poly)
+        min_y = min(p[1] for p in poly)
+        max_y = max(p[1] for p in poly)
+        w = max(1, max_x - min_x)
+        h = max(1, max_y - min_y)
+        step = 8
+        stripes = pygame.Surface((w, h), pygame.SRCALPHA)
+        line_color = (40, 40, 46, max(1, min(255, intensity)))
+        for x in range(step // 2, w, step):
+            pygame.draw.line(stripes, line_color, (x, 0), (x, h), 1)
+        mask = pygame.Surface((w, h), pygame.SRCALPHA)
+        shifted = [(x - min_x, y - min_y) for (x, y) in poly]
+        pygame.draw.polygon(mask, (255, 255, 255, 255), shifted)
+        stripes.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        self.screen.blit(stripes, (min_x, min_y))
+
+    def _blit_tiled_polygon(self, tile: pygame.Surface, poly: list[tuple[int, int]]) -> None:
+        if not poly:
+            return
+        min_x = min(p[0] for p in poly)
+        max_x = max(p[0] for p in poly)
+        min_y = min(p[1] for p in poly)
+        max_y = max(p[1] for p in poly)
+        w = max(1, max_x - min_x)
+        h = max(1, max_y - min_y)
+
+        # Tile into an offscreen surface
+        tiled = pygame.Surface((w, h), pygame.SRCALPHA)
+        ts = tile.get_size()
+        for y in range(0, h, ts[1]):
+            for x in range(0, w, ts[0]):
+                tiled.blit(tile, (x, y))
+
+        # Build a mask for the polygon and multiply to clip
+        mask = pygame.Surface((w, h), pygame.SRCALPHA)
+        shifted = [(x - min_x, y - min_y) for (x, y) in poly]
+        pygame.draw.polygon(mask, (255, 255, 255, 255), shifted)
+        tiled.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+
+        # Blit to screen
+        self.screen.blit(tiled, (min_x, min_y))
