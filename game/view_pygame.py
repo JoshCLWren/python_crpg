@@ -6,6 +6,7 @@ from typing import Tuple
 import pygame
 import math
 import random
+import json
 
 from .dungeon import Dungeon
 import os
@@ -28,10 +29,47 @@ class EOBViewPG:
         self.font = pygame.font.Font(None, 22)
         self.font_large = pygame.font.Font(None, 28)
 
-        # Layer margins similar to Tk view
-        # Bring near layer to screen edges to avoid visible border
-        self.margins_x = [0, 140, 220, 280]
-        self.margins_y = [0, 110, 160, 200]
+        # Layer config: 16 layers using 4-anchor piecewise interpolation
+        # 50/50 floor-ceiling split; anchors define near..far geometry
+        self.layers = 16
+        self.margins_x = [0, 160, 260, 320]
+        self.margins_y = [0, 140, 210, 260]
+
+        # Live tuning support
+        self.tuning_mode = False
+        self.tuning_path = os.path.join(os.getcwd(), "view_tuning.json")
+        self._load_tuning()
+        # Auto-layers (vary slices by visible distance)
+        self.auto_layers = True
+        self._render_layers: int | None = None
+        self._layers_base = 6   # minimum when corridor starts opening up
+        self._layers_per_tile = 2  # add slices per forward tile
+        # Far cap to avoid black void at max range
+        self.cap_far = True
+        # Distance fog (darken last few layers)
+        self.fog_enabled = True
+        self.fog_layers = 8  # number of far layers affected
+        self.fog_far = 0.50  # brightness at the farthest layer
+        self.fog_alpha_far = 0.30  # opacity at the farthest layer (0..1)
+        self.fog_overlay_alpha_far = 0.60  # additional screen-space fog over far ring
+        self.fog_min_start = 6  # do not fog nearer than this layer index
+        self._nearest_front: int | None = None
+        # Tuning hold behavior
+        self._acc_far_x_inc = 0.0
+        self._acc_far_x_dec = 0.0
+        self._acc_far_y_inc = 0.0
+        self._acc_far_y_dec = 0.0
+        self._acc_near_x_inc = 0.0
+        self._acc_near_x_dec = 0.0
+        self._acc_near_y_inc = 0.0
+        self._acc_layer_inc = 0.0
+        self._acc_layer_dec = 0.0
+        # Speeds (pixels per second) and rate (steps/sec)
+        self._spd_far_x = 220.0
+        self._spd_far_y = 220.0
+        self._spd_near_x = 120.0
+        self._spd_near_y = 120.0
+        self._rate_layers = 8.0
 
         # Palette
         self.color_bg = (10, 10, 12)
@@ -79,6 +117,35 @@ class EOBViewPG:
         depth_factors = [0.70, 0.80, 0.92, 1.0]
         self.wall_tiles = [self._tint_surface(base_wall, f) for f in depth_factors]
 
+        # --- Motion cues: texture scroll on floor/ceiling ---
+        self._floor_scroll_y = 0.0
+        self._ceiling_scroll_y = 0.0
+        self._pending_scroll_y = 0.0
+        self._scroll_speed = 420.0  # pixels per second
+        # Track previous player state for step detection
+        self._prev_px = dungeon.player.x
+        self._prev_py = dungeon.player.y
+        self._prev_facing = dungeon.player.facing
+
+        # --- Key-hold movement repeat ---
+        self._hold_repeat_delay_move = 0.22
+        self._hold_repeat_rate_move = 0.11
+        self._hold_repeat_delay_turn = 0.22
+        self._hold_repeat_rate_turn = 0.12
+        self._hold_state = {
+            "forward": {"was_down": False, "acc": 0.0},
+            "back": {"was_down": False, "acc": 0.0},
+            "turn_left": {"was_down": False, "acc": 0.0},
+            "turn_right": {"was_down": False, "acc": 0.0},
+        }
+
+        # --- Vanishing-point perspective (always on) ---
+        self.use_vanishing = True
+        # Controls how quickly geometry converges; lower = faster convergence
+        # Smaller = faster convergence (larger spacing between near wall slices)
+        self.vp_depth_x = 3.0
+        self.vp_depth_y = 6.0
+
     # ----------------- Mainloop -----------------
     def run(self) -> None:
         running = True
@@ -107,6 +174,12 @@ class EOBViewPG:
                     else:
                         if event.key == pygame.K_m:
                             self.map_open = not self.map_open
+                        elif event.key == pygame.K_l:
+                            self.auto_layers = not self.auto_layers
+                        elif event.key == pygame.K_t:
+                            self.tuning_mode = not self.tuning_mode
+                            if not self.tuning_mode:
+                                self._save_tuning()
                         elif event.key in (pygame.K_LEFT, pygame.K_a):
                             self.dungeon.turn_left()
                         elif event.key in (pygame.K_RIGHT, pygame.K_d):
@@ -117,10 +190,54 @@ class EOBViewPG:
                             self.dungeon.step_back()
                         elif event.key in (pygame.K_q,):
                             running = False
+                        # --- Tuning keys ---
+                        elif self.tuning_mode:
+                            if event.key == pygame.K_LEFTBRACKET:  # [
+                                self.margins_x[-1] -= 5
+                                self._clamp_anchors()
+                            elif event.key == pygame.K_RIGHTBRACKET:  # ]
+                                self.margins_x[-1] += 5
+                                self._clamp_anchors()
+                            elif event.key == pygame.K_SEMICOLON:  # ;
+                                self.margins_y[-1] += 5  # increase top/bottom margin -> shorter far wall
+                                self._clamp_anchors()
+                            elif event.key == pygame.K_QUOTE:  # '
+                                self.margins_y[-1] -= 5
+                                self._clamp_anchors()
+                            elif event.key == pygame.K_COMMA:  # , adjust near inset X
+                                self.margins_x[0] = max(0, self.margins_x[0] - 2)
+                                self._clamp_anchors()
+                            elif event.key == pygame.K_PERIOD:  # .
+                                self.margins_x[0] = min(self.width // 4, self.margins_x[0] + 2)
+                                self._clamp_anchors()
+                            elif event.key == pygame.K_SLASH:  # /
+                                self.margins_y[0] = min(self.height // 4, self.margins_y[0] + 2)
+                                self._clamp_anchors()
+                            elif event.key == pygame.K_RSHIFT or event.key == pygame.K_LSHIFT:
+                                pass
+                            elif event.key == pygame.K_MINUS:  # - layers down
+                                self.layers = max(4, self.layers - 1)
+                            elif event.key == pygame.K_EQUALS:  # = layers up
+                                self.layers = min(32, self.layers + 1)
+                            elif event.key == pygame.K_r:
+                                # Reset to defaults
+                                self.layers = 16
+                                self.margins_x = [0, 160, 260, 320]
+                                self.margins_y = [0, 140, 210, 260]
+                            elif event.key == pygame.K_s:
+                                self._save_tuning()
+
+            # Apply held-key repeats using the last frame's dt
+            dt = self.clock.get_time() / 1000.0
+            self._process_hold(dt)
 
             self._draw()
             pygame.display.flip()
             self.clock.tick(60)
+            # Continuous tuning adjustments while keys are held
+            if self.tuning_mode and not self.menu_open:
+                dt = self.clock.get_time() / 1000.0
+                self._update_tuning_held(dt)
 
         pygame.quit()
         sys.exit(0)
@@ -131,21 +248,77 @@ class EOBViewPG:
         s = self.screen
         s.fill(self.color_bg)
 
+        # Detect step to trigger texture scroll
+        p = self.dungeon.player
+        if (p.x, p.y) != (self._prev_px, self._prev_py):
+            dx = p.x - self._prev_px
+            dy = p.y - self._prev_py
+            # Facing vector from previous frame
+            dir_vecs = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+            fdx, fdy = dir_vecs[self._prev_facing]
+            if (dx, dy) == (fdx, fdy):
+                # Forward step: scroll floor towards camera
+                self._pending_scroll_y += self._tile_size
+            elif (dx, dy) == (-fdx, -fdy):
+                # Backwards step: scroll away
+                self._pending_scroll_y -= self._tile_size
+            # Update stored state
+            self._prev_px, self._prev_py, self._prev_facing = p.x, p.y, p.facing
+
+        # Apply scroll animation incrementally based on frame time
+        dt = self.clock.get_time() / 1000.0
+        if self._pending_scroll_y != 0.0:
+            step = self._scroll_speed * dt
+            if abs(step) > abs(self._pending_scroll_y):
+                step = abs(self._pending_scroll_y)
+            step *= 1 if self._pending_scroll_y > 0 else -1
+            self._floor_scroll_y += step
+            self._ceiling_scroll_y += step * 0.5  # subtler on ceiling
+            self._pending_scroll_y -= step
+            # Keep offsets bounded [0, tile)
+            ts = self._tile_size
+            self._floor_scroll_y %= ts
+            self._ceiling_scroll_y %= ts
+
         if self.map_open:
             self._draw_map()
         else:
             # Ceiling and floor with subtle torch flicker brightness
             flicker = self._flicker()
-            self._blit_tiled(self.tile_ceiling, pygame.Rect(0, 0, W, H // 2), brightness=flicker)
-            self._blit_tiled(self.tile_floor, pygame.Rect(0, H // 2, W, H // 2), brightness=flicker)
+            self._blit_tiled(self.tile_ceiling, pygame.Rect(0, 0, W, H // 2), brightness=flicker, alpha=255, offset=(0, int(self._ceiling_scroll_y)))
+            self._blit_tiled(self.tile_floor, pygame.Rect(0, H // 2, W, H // 2), brightness=flicker, alpha=255, offset=(0, int(self._floor_scroll_y)))
+
+            # Determine dynamic layer count based on visible distance (per world tile)
+            # Also precompute nearest blocking wall straight ahead
+            nearest_front: int | None = None
+            max_probe = 256
+            for k in range(max_probe):
+                wxk, wyk = self.dungeon.transform_local(k + 1, 0)
+                if self.dungeon.is_wall(wxk, wyk):
+                    nearest_front = k
+                    break
+
+            # Layers now map to world tiles: render up to the hit tile, else up to geometry limit
+            if nearest_front is not None:
+                dyn_layers = nearest_front + 1  # include the front face layer
+            else:
+                dyn_layers = self._geom_depth_limit()
+            self._render_layers = dyn_layers
+            self._nearest_front = nearest_front
 
             # Draw far to near layers
-            for d in reversed(range(4)):
+            for d in reversed(range(dyn_layers)):
                 fx1, fy1, fx2, fy2 = self._front_rect(d)
                 wx, wy = self.dungeon.transform_local(d + 1, 0)
                 front_is_wall = self.dungeon.is_wall(wx, wy)
 
-                if d < 3:
+                # Draw side walls up to the layer before the front in vanishing mode;
+                # in anchor mode, cap to available anchors to avoid degenerate polys.
+                if getattr(self, "use_vanishing", False):
+                    side_ok = d < dyn_layers - 1
+                else:
+                    side_ok = d < min(dyn_layers - 1, len(self.margins_x) - 1, len(self.margins_y) - 1)
+                if side_ok:
                     # Side walls for this depth, even if front is a wall
                     lx, ly = self.dungeon.transform_local(d + 1, -1)
                     if self.dungeon.is_wall(lx, ly):
@@ -154,15 +327,46 @@ class EOBViewPG:
                     if self.dungeon.is_wall(rx, ry):
                         self._side_wall(d, left=False)
 
-                if front_is_wall:
+                if front_is_wall and (nearest_front is None or d == nearest_front):
                     # Draw front-facing wall after side walls for correct overlap
                     rect = pygame.Rect(fx1, fy1, fx2 - fx1, fy2 - fy1)
-                    self._blit_tiled(self.wall_tiles[d], rect)
-                    pygame.draw.rect(s, self.color_outline, rect, width=2)
+                    base_tile = self.wall_tiles[min(d, len(self.wall_tiles) - 1)]
+                    tile = base_tile
+                    alpha = 255
+                    if self.fog_enabled:
+                        # Never fog the nearest blocking front wall
+                        if self._nearest_front is not None and d == self._nearest_front:
+                            fog_b, fog_a = 1.0, 1.0
+                        else:
+                            fog_b, fog_a = self._fog_params(d, dyn_layers)
+                        tile = self._tint_surface(base_tile, fog_b)
+                        alpha = int(255 * fog_a)
+                    self._blit_tiled(tile, rect, alpha=alpha)
+                    # Skip outlines in fog zone to avoid visual density
+                    if not self._in_fog_zone(d, dyn_layers):
+                        pygame.draw.rect(s, self.color_outline, rect, width=2)
                     continue
+            # If no wall in sight and cap is enabled, draw a dim far cap at the last layer
+            if nearest_front is None and self.cap_far:
+                d = dyn_layers - 1
+                fx1, fy1, fx2, fy2 = self._front_rect(d)
+                rect = pygame.Rect(fx1, fy1, fx2 - fx1, fy2 - fy1)
+                tile = self.wall_tiles[-1]
+                fog_b = self.fog_far if self.fog_enabled else 0.6
+                fog_a = self.fog_alpha_far if self.fog_enabled else 1.0
+                capped = self._tint_surface(tile, fog_b)
+                self._blit_tiled(capped, rect, alpha=int(255 * fog_a))
+                if fog_a > 0.9:
+                    pygame.draw.rect(s, self.color_outline, rect, width=2)
+                # Will overlay fog rings after all geometry
+            # Overlay fog rings after all geometry so fade is visible
+            if self.fog_enabled:
+                self._draw_fog_overlays(dyn_layers)
+            # Clear per-frame layers after draw
+            self._render_layers = None
+            self._nearest_front = None
 
         # HUD
-        p = self.dungeon.player
         facing = ["N", "E", "S", "W"][p.facing]
         extra = " • M: Map" if not self.map_open else " • M: Close Map"
         text = f"Pos: ({p.x},{p.y})  Facing: {facing}  [Arrows/WASD to move, ESC menu{extra}]"
@@ -177,6 +381,9 @@ class EOBViewPG:
         # Menu overlay
         if self.menu_open:
             self._draw_menu()
+        # Tuning overlay
+        if self.tuning_mode and not self.menu_open:
+            self._draw_tuning_overlay()
 
     def _draw_map(self) -> None:
         W, H = self.width, self.height
@@ -247,7 +454,8 @@ class EOBViewPG:
 
     def _front_rect(self, d: int) -> tuple[int, int, int, int]:
         W, H = self.width, self.height
-        mx, my = self.margins_x[d], self.margins_y[d]
+        mx = self._mx(d)
+        my = self._my(d)
         return (mx, my, W - mx, H - my)
 
     def _rect_with_outline(self, rect: tuple[int, int, int, int], fill: Color) -> None:
@@ -256,8 +464,8 @@ class EOBViewPG:
 
     def _side_wall(self, d: int, *, left: bool) -> None:
         W, H = self.width, self.height
-        mx0, my0 = self.margins_x[d], self.margins_y[d]
-        mx1, my1 = self.margins_x[d + 1], self.margins_y[d + 1]
+        mx0, my0 = self._mx(d), self._my(d)
+        mx1, my1 = self._mx(d + 1), self._my(d + 1)
         if left:
             poly = [
                 (mx0, my0),
@@ -273,8 +481,21 @@ class EOBViewPG:
                 (W - mx1, my1),
             ]
         # Texture-map side wall by tiling and masking to polygon
-        self._blit_tiled_polygon(self.wall_tiles[d], poly)
-        pygame.draw.polygon(self.screen, self.color_outline, poly, width=2)
+        base_tile = self.wall_tiles[min(d, len(self.wall_tiles) - 1)]
+        tile = base_tile
+        layers = self._render_layers if self._render_layers is not None else self.layers
+        alpha = 255
+        if self.fog_enabled:
+            # Do not fog side faces at or before the nearest blocking front
+            if self._nearest_front is not None and d <= self._nearest_front:
+                fog_b, fog_a = 1.0, 1.0
+            else:
+                fog_b, fog_a = self._fog_params(d, layers)
+            tile = self._tint_surface(base_tile, fog_b)
+            alpha = int(255 * fog_a)
+        self._blit_tiled_polygon(tile, poly, alpha=alpha)
+        if not self._in_fog_zone(d, layers):
+            pygame.draw.polygon(self.screen, self.color_outline, poly, width=2)
 
     # ----------------- UI Helpers -----------------
     def _draw_menu(self) -> None:
@@ -426,20 +647,33 @@ class EOBViewPG:
         surf.blit(tint, (0, 0), special_flags=pygame.BLEND_MULT)
         return surf
 
-    def _blit_tiled(self, tile: pygame.Surface, rect: pygame.Rect, *, brightness: float = 1.0) -> None:
+    def _blit_tiled(self, tile: pygame.Surface, rect: pygame.Rect, *, brightness: float = 1.0, alpha: int = 255, offset: tuple[int, int] | None = None) -> None:
         # Optionally apply brightness by blitting a tinted copy once per call
         if brightness != 1.0:
             tile = self._tint_surface(tile, brightness)
         ts = tile.get_size()
         x0, y0, w, h = rect
-        prev_clip = self.screen.get_clip()
-        self.screen.set_clip(rect)
-        try:
-            for y in range(y0, y0 + h, ts[1]):
-                for x in range(x0, x0 + w, ts[0]):
-                    self.screen.blit(tile, (x, y))
-        finally:
-            self.screen.set_clip(prev_clip)
+        ox, oy = (0, 0) if offset is None else (offset[0] % ts[0], offset[1] % ts[1])
+        if alpha >= 255:
+            prev_clip = self.screen.get_clip()
+            self.screen.set_clip(rect)
+            try:
+                start_y = y0 - oy
+                start_x = x0 - ox
+                for y in range(start_y, y0 + h, ts[1]):
+                    for x in range(start_x, x0 + w, ts[0]):
+                        self.screen.blit(tile, (x, y))
+            finally:
+                self.screen.set_clip(prev_clip)
+        else:
+            patch = pygame.Surface((w, h), pygame.SRCALPHA)
+            start_y = -oy
+            start_x = -ox
+            for y in range(start_y, h, ts[1]):
+                for x in range(start_x, w, ts[0]):
+                    patch.blit(tile, (x, y))
+            patch.set_alpha(max(0, min(255, alpha)))
+            self.screen.blit(patch, (x0, y0))
 
     def _flicker(self) -> float:
         # Smooth flicker from combined sines
@@ -468,7 +702,7 @@ class EOBViewPG:
         stripes.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
         self.screen.blit(stripes, (min_x, min_y))
 
-    def _blit_tiled_polygon(self, tile: pygame.Surface, poly: list[tuple[int, int]]) -> None:
+    def _blit_tiled_polygon(self, tile: pygame.Surface, poly: list[tuple[int, int]], alpha: int = 255) -> None:
         if not poly:
             return
         min_x = min(p[0] for p in poly)
@@ -490,6 +724,311 @@ class EOBViewPG:
         shifted = [(x - min_x, y - min_y) for (x, y) in poly]
         pygame.draw.polygon(mask, (255, 255, 255, 255), shifted)
         tiled.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        if alpha < 255:
+            tiled.set_alpha(max(0, min(255, alpha)))
 
         # Blit to screen
         self.screen.blit(tiled, (min_x, min_y))
+
+    def _process_hold(self, dt: float) -> None:
+        if self.menu_open or self.map_open:
+            # Do not process movement while UI is open
+            for st in self._hold_state.values():
+                st["was_down"] = False
+                st["acc"] = 0.0
+            return
+        keys = pygame.key.get_pressed()
+
+        def update(action: str, down: bool, do_step, delay: float, rate: float) -> None:
+            st = self._hold_state[action]
+            if down:
+                if not st["was_down"]:
+                    st["was_down"] = True
+                    st["acc"] = -delay
+                else:
+                    st["acc"] += dt
+                    while st["acc"] >= rate:
+                        do_step()
+                        st["acc"] -= rate
+            else:
+                st["was_down"] = False
+                st["acc"] = 0.0
+
+        # Mapping: W/Up forward, S/Down back, A/Left turn left, D/Right turn right
+        update(
+            "forward",
+            keys[pygame.K_w] or keys[pygame.K_UP],
+            self.dungeon.step_forward,
+            self._hold_repeat_delay_move,
+            self._hold_repeat_rate_move,
+        )
+        update(
+            "back",
+            keys[pygame.K_s] or keys[pygame.K_DOWN],
+            self.dungeon.step_back,
+            self._hold_repeat_delay_move,
+            self._hold_repeat_rate_move,
+        )
+        update(
+            "turn_left",
+            keys[pygame.K_a] or keys[pygame.K_LEFT],
+            self.dungeon.turn_left,
+            self._hold_repeat_delay_turn,
+            self._hold_repeat_rate_turn,
+        )
+        update(
+            "turn_right",
+            keys[pygame.K_d] or keys[pygame.K_RIGHT],
+            self.dungeon.turn_right,
+            self._hold_repeat_delay_turn,
+            self._hold_repeat_rate_turn,
+        )
+
+    def _fog_params(self, d: int, layers: int) -> tuple[float, float]:
+        if not self.fog_enabled or layers <= 1:
+            return 1.0, 1.0
+        # Start fog no nearer than fog_min_start, and in the last fog_layers
+        start = max(self.fog_min_start, layers - self.fog_layers)
+        if d <= start:
+            return 1.0, 1.0
+        span = max(1, self.fog_layers - 1)
+        t = min(1.0, (d - start) / span)
+        brightness = 1.0 - t * (1.0 - self.fog_far)
+        alpha = 1.0 - t * (1.0 - self.fog_alpha_far)
+        return brightness, alpha
+
+    def _in_fog_zone(self, d: int, layers: int) -> bool:
+        if not self.fog_enabled:
+            return False
+        start = max(self.fog_min_start, layers - self.fog_layers)
+        return d >= start
+
+    def _draw_fog_overlays(self, layers: int) -> None:
+        if not self.fog_enabled or layers <= 1:
+            return
+        start = max(self.fog_min_start, layers - self.fog_layers)
+        # Do not overlay nearer than the front hit
+        nearest = self._nearest_front if self._nearest_front is not None else -1
+        for d in range(max(start, nearest + 1), layers):
+            fx1, fy1, fx2, fy2 = self._front_rect(d)
+            rect = pygame.Rect(fx1, fy1, fx2 - fx1, fy2 - fy1)
+            # Compute overlay alpha per ring
+            span = max(1, self.fog_layers - 1)
+            t = min(1.0, max(0.0, (d - start) / span))
+            a = int(255 * (t * self.fog_overlay_alpha_far))
+            if a <= 0:
+                continue
+            ring = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+            ring.fill((0, 0, 0, a))
+            # punch inner hole for next-nearer rectangle
+            if d > 0:
+                inx1, iny1, inx2, iny2 = self._front_rect(d - 1)
+                inner = pygame.Rect(inx1 - fx1, iny1 - fy1, (inx2 - inx1), (iny2 - iny1))
+                if inner.width > 0 and inner.height > 0:
+                    pygame.draw.rect(ring, (0, 0, 0, 0), inner)
+            self.screen.blit(ring, rect.topleft)
+
+    def _geom_depth_limit(self) -> int:
+        # Find largest d such that the rectangle still has drawable area
+        # Avoid infinite depth by capping to a reasonable number of tiles.
+        max_d = 256
+        last_d = 1
+        for d in range(1, max_d + 1):
+            x1, y1, x2, y2 = self._front_rect(d)
+            if (x2 - x1) <= 2 or (y2 - y1) <= 2:
+                break
+            last_d = d
+        return last_d
+
+    def _update_tuning_held(self, dt: float) -> None:
+        keys = pygame.key.get_pressed()
+        changed = False
+        # Far X: [ decrease, ] increase
+        if keys[pygame.K_LEFTBRACKET]:
+            self._acc_far_x_dec += self._spd_far_x * dt
+            steps = int(self._acc_far_x_dec)
+            if steps:
+                self.margins_x[-1] -= steps
+                self._acc_far_x_dec -= steps
+                changed = True
+        else:
+            self._acc_far_x_dec = 0.0
+        if keys[pygame.K_RIGHTBRACKET]:
+            self._acc_far_x_inc += self._spd_far_x * dt
+            steps = int(self._acc_far_x_inc)
+            if steps:
+                self.margins_x[-1] += steps
+                self._acc_far_x_inc -= steps
+                changed = True
+        else:
+            self._acc_far_x_inc = 0.0
+
+        # Far Y: ; increase margin (shorter), ' decrease margin (taller)
+        if keys[pygame.K_SEMICOLON]:
+            self._acc_far_y_inc += self._spd_far_y * dt
+            steps = int(self._acc_far_y_inc)
+            if steps:
+                self.margins_y[-1] += steps
+                self._acc_far_y_inc -= steps
+                changed = True
+        else:
+            self._acc_far_y_inc = 0.0
+        if keys[pygame.K_QUOTE]:
+            self._acc_far_y_dec += self._spd_far_y * dt
+            steps = int(self._acc_far_y_dec)
+            if steps:
+                self.margins_y[-1] -= steps
+                self._acc_far_y_dec -= steps
+                changed = True
+        else:
+            self._acc_far_y_dec = 0.0
+
+        # Near X: , decrease inset, . increase inset
+        if keys[pygame.K_COMMA]:
+            self._acc_near_x_dec += self._spd_near_x * dt
+            steps = int(self._acc_near_x_dec)
+            if steps:
+                self.margins_x[0] = max(0, self.margins_x[0] - steps)
+                self._acc_near_x_dec -= steps
+                changed = True
+        else:
+            self._acc_near_x_dec = 0.0
+        if keys[pygame.K_PERIOD]:
+            self._acc_near_x_inc += self._spd_near_x * dt
+            steps = int(self._acc_near_x_inc)
+            if steps:
+                self.margins_x[0] = min(self.width // 4, self.margins_x[0] + steps)
+                self._acc_near_x_inc -= steps
+                changed = True
+        else:
+            self._acc_near_x_inc = 0.0
+
+        # Near Y: / increase inset (we don't implement decrease to keep controls simple)
+        if keys[pygame.K_SLASH]:
+            self._acc_near_y_inc += self._spd_near_y * dt
+            steps = int(self._acc_near_y_inc)
+            if steps:
+                self.margins_y[0] = min(self.height // 4, self.margins_y[0] + steps)
+                self._acc_near_y_inc -= steps
+                changed = True
+        else:
+            self._acc_near_y_inc = 0.0
+
+        # Layers: - decrease, = increase
+        if keys[pygame.K_MINUS]:
+            self._acc_layer_dec += self._rate_layers * dt
+            steps = int(self._acc_layer_dec)
+            if steps:
+                self.layers = max(4, self.layers - steps)
+                self._acc_layer_dec -= steps
+                changed = True
+        else:
+            self._acc_layer_dec = 0.0
+        if keys[pygame.K_EQUALS]:
+            self._acc_layer_inc += self._rate_layers * dt
+            steps = int(self._acc_layer_inc)
+            if steps:
+                self.layers = min(32, self.layers + steps)
+                self._acc_layer_inc -= steps
+                changed = True
+        else:
+            self._acc_layer_inc = 0.0
+
+        if changed:
+            self._clamp_anchors()
+
+    def _mx(self, d: int) -> int:
+        # Vanishing-point mode: converge towards center with distance.
+        if getattr(self, "use_vanishing", False):
+            W = self.width
+            half = W // 2 - 1
+            k = max(0.01, float(self.vp_depth_x))
+            t = (d) / (d + k)
+            return int(half * t)
+        # Anchor mode fallback
+        anchors = self.margins_x
+        if not anchors:
+            return 0
+        idx = min(max(0, d), len(anchors) - 1)
+        return int(anchors[idx])
+
+    def _my(self, d: int) -> int:
+        # Vanishing-point mode: tie vertical convergence to horizontal to keep edges straight
+        if getattr(self, "use_vanishing", False):
+            H = self.height
+            # Maintain far-end proportion to ensure straight side edges
+            far_mx = max(1, self.margins_x[-1])
+            far_my = max(1, self.margins_y[-1])
+            r = min((H // 2 - 1) / far_mx, far_my / far_mx)
+            mx = self._mx(d)
+            return int(min(H // 2 - 1, r * mx))
+        # Anchor mode fallback
+        anchors = self.margins_y
+        if not anchors:
+            return 0
+        idx = min(max(0, d), len(anchors) - 1)
+        return int(anchors[idx])
+
+    # ----------------- Tuning persistence & overlay -----------------
+    def _clamp_anchors(self) -> None:
+        # Ensure monotonic increase and reasonable bounds
+        max_x = self.width // 2 - 2
+        max_y = self.height // 2 - 2
+        self.margins_x = [max(0, min(max_x, v)) for v in self.margins_x]
+        self.margins_y = [max(0, min(max_y, v)) for v in self.margins_y]
+        for i in range(1, len(self.margins_x)):
+            if self.margins_x[i] < self.margins_x[i - 1]:
+                self.margins_x[i] = self.margins_x[i - 1]
+        for i in range(1, len(self.margins_y)):
+            if self.margins_y[i] < self.margins_y[i - 1]:
+                self.margins_y[i] = self.margins_y[i - 1]
+
+    def _load_tuning(self) -> None:
+        try:
+            if os.path.exists(self.tuning_path):
+                with open(self.tuning_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                layers = int(data.get("layers", self.layers))
+                mx = data.get("margins_x")
+                my = data.get("margins_y")
+                if isinstance(mx, list) and len(mx) == 4:
+                    self.margins_x = [int(v) for v in mx]
+                if isinstance(my, list) and len(my) == 4:
+                    self.margins_y = [int(v) for v in my]
+                self.layers = max(4, min(32, layers))
+                self._clamp_anchors()
+        except Exception:
+            # Ignore malformed file; keep defaults
+            pass
+
+    def _save_tuning(self) -> None:
+        try:
+            data = {
+                "layers": self.layers,
+                "margins_x": self.margins_x,
+                "margins_y": self.margins_y,
+            }
+            with open(self.tuning_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self._toast("Tuning saved.")
+        except Exception as e:
+            self._toast(f"Save failed: {e}")
+
+    def _draw_tuning_overlay(self) -> None:
+        W, H = self.width, self.height
+        overlay = pygame.Surface((W, 160), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 170))
+        self.screen.blit(overlay, (0, 0))
+        lines = [
+            f"TUNING MODE (T)  S:save  R:reset  -/+:layers ({self.layers})  L:auto-layers={'on' if self.auto_layers else 'off'}",
+            f"margins_x anchors: {self.margins_x}   [ / ] alters far X   , / . near X",
+            f"margins_y anchors: {self.margins_y}   ; / ' alters far Y   / near Y+",
+            f"fog: last {self.fog_layers} layers, brightness floor {self.fog_far:.2f}",
+        ]
+        y = 10
+        for line in lines:
+            surf = self.font.render(line, True, self.color_text)
+            self.screen.blit(surf, (10, y))
+            y += 22
+
+    # Removed dynamic perspective helpers to revert to tuned static 4-layer view

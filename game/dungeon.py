@@ -245,3 +245,29 @@ def generate_maze(width: int, height: int, *, seed: Optional[int] = None) -> Lis
         grid[iy][w - 1] = 1
 
     return grid
+
+
+def generate_long_corridor(length: int = 101, height: int = 9) -> List[List[Tile]]:
+    """Generate a long straight corridor for testing the renderer.
+
+    - The corridor runs East-West along the center row.
+    - All outer borders are walls; only the center row from x=1..length-2 is floor.
+    - Length is clamped to >= 7 and made odd; height is clamped to >= 5 and made odd.
+    """
+    # Validate and normalize dimensions
+    if length < 7:
+        length = 7
+    if height < 5:
+        height = 5
+    # Make odd for symmetry
+    if length % 2 == 0:
+        length -= 1
+    if height % 2 == 0:
+        height -= 1
+
+    grid: List[List[Tile]] = [[1 for _ in range(length)] for _ in range(height)]
+    mid = height // 2
+    for x in range(1, length - 1):
+        grid[mid][x] = 0
+    # keep outer border as walls
+    return grid
