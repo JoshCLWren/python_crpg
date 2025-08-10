@@ -46,6 +46,15 @@ class EOBViewPG:
         self.color_menu_box = (25, 25, 30)
         self.color_menu_highlight = (80, 120, 220)
 
+        # Map palette
+        self.color_map_bg = (8, 8, 10)
+        self.color_map_grid = (30, 30, 36)
+        self.color_map_wall = (70, 70, 80)
+        self.color_map_floor_unseen = (16, 16, 18)
+        self.color_map_floor_seen = (140, 140, 155)
+        self.color_map_player = (240, 220, 60)
+        self.color_map_player_fov = (240, 220, 60)
+
         # Menu state
         self.menu_open = False
         self.menu_items = ["Resume", "Save", "Load", "Quit"]
@@ -53,6 +62,9 @@ class EOBViewPG:
         self.save_path = os.path.join(os.getcwd(), "savegame.json")
         self._toast_text: str | None = None
         self._toast_until: float = 0.0
+
+        # Map state
+        self.map_open = False
 
     # ----------------- Mainloop -----------------
     def run(self) -> None:
@@ -80,7 +92,9 @@ class EOBViewPG:
                             elif choice == "Quit":
                                 running = False
                     else:
-                        if event.key in (pygame.K_LEFT, pygame.K_a):
+                        if event.key == pygame.K_m:
+                            self.map_open = not self.map_open
+                        elif event.key in (pygame.K_LEFT, pygame.K_a):
                             self.dungeon.turn_left()
                         elif event.key in (pygame.K_RIGHT, pygame.K_d):
                             self.dungeon.turn_right()
@@ -104,32 +118,36 @@ class EOBViewPG:
         s = self.screen
         s.fill(self.color_bg)
 
-        # Ceiling and floor
-        pygame.draw.rect(s, self.color_ceiling, pygame.Rect(0, 0, W, H // 2))
-        pygame.draw.rect(s, self.color_floor, pygame.Rect(0, H // 2, W, H // 2))
+        if self.map_open:
+            self._draw_map()
+        else:
+            # Ceiling and floor
+            pygame.draw.rect(s, self.color_ceiling, pygame.Rect(0, 0, W, H // 2))
+            pygame.draw.rect(s, self.color_floor, pygame.Rect(0, H // 2, W, H // 2))
 
-        # Draw far to near layers
-        for d in reversed(range(4)):
-            fx1, fy1, fx2, fy2 = self._front_rect(d)
-            wx, wy = self.dungeon.transform_local(d + 1, 0)
-            if self.dungeon.is_wall(wx, wy):
-                self._rect_with_outline((fx1, fy1, fx2 - fx1, fy2 - fy1), self._wall_color(d))
-                continue
+            # Draw far to near layers
+            for d in reversed(range(4)):
+                fx1, fy1, fx2, fy2 = self._front_rect(d)
+                wx, wy = self.dungeon.transform_local(d + 1, 0)
+                if self.dungeon.is_wall(wx, wy):
+                    self._rect_with_outline((fx1, fy1, fx2 - fx1, fy2 - fy1), self._wall_color(d))
+                    continue
 
-            if d < 3:
-                # Left side wall
-                lx, ly = self.dungeon.transform_local(d + 1, -1)
-                if self.dungeon.is_wall(lx, ly):
-                    self._side_wall(d, left=True)
-                # Right side wall
-                rx, ry = self.dungeon.transform_local(d + 1, 1)
-                if self.dungeon.is_wall(rx, ry):
-                    self._side_wall(d, left=False)
+                if d < 3:
+                    # Left side wall
+                    lx, ly = self.dungeon.transform_local(d + 1, -1)
+                    if self.dungeon.is_wall(lx, ly):
+                        self._side_wall(d, left=True)
+                    # Right side wall
+                    rx, ry = self.dungeon.transform_local(d + 1, 1)
+                    if self.dungeon.is_wall(rx, ry):
+                        self._side_wall(d, left=False)
 
         # HUD
         p = self.dungeon.player
         facing = ["N", "E", "S", "W"][p.facing]
-        text = f"Pos: ({p.x},{p.y})  Facing: {facing}  [Arrows/WASD to move, ESC menu]"
+        extra = " • M: Map" if not self.map_open else " • M: Close Map"
+        text = f"Pos: ({p.x},{p.y})  Facing: {facing}  [Arrows/WASD to move, ESC menu{extra}]"
         surf = self.font.render(text, True, self.color_text)
         s.blit(surf, (W // 2 - surf.get_width() // 2, H - 26))
 
@@ -141,6 +159,69 @@ class EOBViewPG:
         # Menu overlay
         if self.menu_open:
             self._draw_menu()
+
+    def _draw_map(self) -> None:
+        W, H = self.width, self.height
+        s = self.screen
+        s.fill(self.color_map_bg)
+
+        grid = self.dungeon.grid
+        visited = self.dungeon.visited
+        rows = len(grid)
+        cols = len(grid[0]) if rows else 0
+        if rows == 0 or cols == 0:
+            return
+
+        # Compute tile size with some margin
+        margin = 40
+        available_w = W - margin * 2
+        available_h = H - margin * 2
+        tile_w = max(2, min(32, available_w // cols))
+        tile_h = max(2, min(32, available_h // rows))
+        tile = min(tile_w, tile_h)
+        map_w = tile * cols
+        map_h = tile * rows
+        offset_x = (W - map_w) // 2
+        offset_y = (H - map_h) // 2
+
+        # Draw grid background and cells
+        for y in range(rows):
+            for x in range(cols):
+                rx = offset_x + x * tile
+                ry = offset_y + y * tile
+                rect = pygame.Rect(rx, ry, tile, tile)
+                if grid[y][x] == 1:
+                    pygame.draw.rect(s, self.color_map_wall, rect)
+                else:
+                    color = self.color_map_floor_seen if visited[y][x] else self.color_map_floor_unseen
+                    pygame.draw.rect(s, color, rect)
+
+        # Grid lines to delineate cells
+        for y in range(rows + 1):
+            ypix = offset_y + y * tile
+            pygame.draw.line(s, self.color_map_grid, (offset_x, ypix), (offset_x + map_w, ypix), 1)
+        for x in range(cols + 1):
+            xpix = offset_x + x * tile
+            pygame.draw.line(s, self.color_map_grid, (xpix, offset_y), (xpix, offset_y + map_h), 1)
+
+        # Draw player position and facing
+        p = self.dungeon.player
+        px = offset_x + p.x * tile + tile // 2
+        py = offset_y + p.y * tile + tile // 2
+        r = max(3, tile // 3)
+        pygame.draw.circle(s, self.color_map_player, (px, py), r)
+        # Facing indicator
+        dir_vecs = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+        dx, dy = dir_vecs[p.facing]
+        tip_x = px + int(dx * r * 1.6)
+        tip_y = py + int(dy * r * 1.6)
+        pygame.draw.line(s, self.color_map_player, (px, py), (tip_x, tip_y), 2)
+
+        # Title / legend
+        title = self.font_large.render("Dungeon Map", True, self.color_text)
+        s.blit(title, (W // 2 - title.get_width() // 2, offset_y - 30))
+        legend = self.font.render("#: wall  • dark: unseen  • light: visited  • dot+arrow: you", True, self.color_text)
+        s.blit(legend, (W // 2 - legend.get_width() // 2, offset_y + map_h + 10))
 
     def _wall_color(self, d: int) -> Color:
         idx = max(0, min(3, d))
