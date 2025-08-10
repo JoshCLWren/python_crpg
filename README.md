@@ -1,28 +1,53 @@
 # python_crpg
 
-Minimal terminal CRPG starter written in Python. It provides a small but complete loop: a main menu, exploration across a handful of locations, random encounters, simple turn-based combat, and basic save/load.
+A minimal grid-based, first-person dungeon crawler in the style of Eye of the Beholder, rendered with Pygame. Movement is step-based on a 2D grid while the view renders a faux-3D corridor using layered wall slices.
+
+## Setup (pyenv + venv)
+
+This project uses pyenv to pin a Python version and a local virtualenv via the Makefile.
+
+1) Install pyenv
+- macOS: `brew install pyenv`
+- Linux: follow https://github.com/pyenv/pyenv#installation
+- Windows: use WSL + pyenv, or install Python 3.12 from python.org and skip pyenv.
+
+2) Install and select Python
+- `pyenv install 3.12.5`
+- `pyenv local 3.12.5` (repo includes `.python-version`)
+
+3) Create venv and install deps
+- `make install`
 
 ## Run
 
-- Ensure Python 3.8+ is available: `python3 --version`
-- Start the game: `python3 main.py`
+- `make run`
 
 ## Gameplay
 
-- Menu: start a New Game, Load Game, or Quit.
-- Explore: move forward/back between locations, rest to heal, check inventory, or save.
-- Encounters: random enemies appear while moving. Choose to attack, drink a potion, or run.
-- Save/Load: writes `savegame.json` in the project root.
+- Movement: arrows or WASD to turn/move; `Q` quits.
+- View: layered wall slices draw front and side walls for 4 depths.
+- Map: simple built-in dungeon; walls are impassable.
 
 ## Project Structure
 
-- `main.py`: entry point that launches the game.
-- `game/game.py`: game states (menu, explore, combat), world flow, save/load.
-- `game/entities.py`: `Player` and `Monster` dataclasses and shared behavior.
+- `main.py`: entry point launching the Pygame view.
+- `game/dungeon.py`: map grid, player state, and movement.
+- `game/view_pygame.py`: Pygame renderer for an Eye-of-the-Beholder-style view.
+
+## Makefile
+
+- `make venv`: create a virtual environment in `.venv`.
+- `make install`: install `requirements.txt` into the venv.
+- `make run`: run the game within the venv.
+- `make freeze`: export current venv packages to `requirements.txt`.
+- `make clean`: remove venv and Python cache files.
+- `make doctor`: verify Tkinter is available in your Python/venv.
+
+If Tkinter is missing on your Python, the game will use Pygame instead. If you see import errors for Pygame, run `make install` (network required to download wheels).
 
 ## Next Ideas
 
-- Add more room types, items, and loot drops.
-- Expand stats (defense, accuracy, skills) and status effects.
-- Add quests, shops, and a simple story arc.
-- Extract UI/IO to support different frontends later.
+- Add sprites/textures for walls, floor, UI widgets.
+- Add automap and minimap overlay.
+- Add entities (monsters, items) and interactions in 3D view.
+- Add step-animations and sound.

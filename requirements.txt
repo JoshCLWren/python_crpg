@@ -1,0 +1,2 @@
+# Runtime dependencies
+pygame==2.5.2
