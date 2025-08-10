@@ -116,6 +116,8 @@ class EOBViewPG:
         # Pre-tint 4 depth variants to mirror existing palette steps
         depth_factors = [0.70, 0.80, 0.92, 1.0]
         self.wall_tiles = [self._tint_surface(base_wall, f) for f in depth_factors]
+        # Procedural monster sprites
+        self.monster_sprites = self._gen_monster_sprites(64)
 
         # --- Motion cues: texture scroll on floor/ceiling ---
         self._floor_scroll_y = 0.0
@@ -230,6 +232,10 @@ class EOBViewPG:
             # Apply held-key repeats using the last frame's dt
             dt = self.clock.get_time() / 1000.0
             self._process_hold(dt)
+
+            # Pull any game messages from dungeon (pickups/combat)
+            for msg in self.dungeon.drain_messages():
+                self._toast(msg)
 
             self._draw()
             pygame.display.flip()
@@ -359,6 +365,9 @@ class EOBViewPG:
                 if fog_a > 0.9:
                     pygame.draw.rect(s, self.color_outline, rect, width=2)
                 # Will overlay fog rings after all geometry
+            # Draw monsters within visible depth before fog overlays
+            self._draw_monsters(dyn_layers)
+
             # Overlay fog rings after all geometry so fade is visible
             if self.fog_enabled:
                 self._draw_fog_overlays(dyn_layers)
@@ -369,7 +378,11 @@ class EOBViewPG:
         # HUD
         facing = ["N", "E", "S", "W"][p.facing]
         extra = " • M: Map" if not self.map_open else " • M: Close Map"
-        text = f"Pos: ({p.x},{p.y})  Facing: {facing}  [Arrows/WASD to move, ESC menu{extra}]"
+        weapon = p.weapon or "Fists"
+        text = (
+            f"Pos: ({p.x},{p.y})  Facing: {facing}  HP: {p.hp}  Gold: {p.gold}  "
+            f"Weapon: {weapon} (+{p.weapon_atk})  [Arrows/WASD to move, ESC menu{extra}]"
+        )
         surf = self.font.render(text, True, self.color_text)
         s.blit(surf, (W // 2 - surf.get_width() // 2, H - 26))
 
@@ -429,7 +442,25 @@ class EOBViewPG:
             xpix = offset_x + x * tile
             pygame.draw.line(s, self.color_map_grid, (xpix, offset_y), (xpix, offset_y + map_h), 1)
 
-        # Draw player position and facing
+        # Draw items (gold/weapons)
+        for it in getattr(self.dungeon, "items", []):
+            rx = offset_x + it.x * tile
+            ry = offset_y + it.y * tile
+            rect = pygame.Rect(rx + tile // 4, ry + tile // 4, max(2, tile // 2), max(2, tile // 2))
+            if getattr(it, "kind", "") == "gold":
+                color = (220, 200, 60)  # gold
+            else:
+                color = (80, 180, 240)  # weapon
+            pygame.draw.rect(s, color, rect)
+
+        # Draw monsters
+        for m in getattr(self.dungeon, "monsters", []):
+            rx = offset_x + m.x * tile + tile // 2
+            ry = offset_y + m.y * tile + tile // 2
+            rr = max(3, tile // 3)
+            pygame.draw.circle(s, (200, 60, 60), (rx, ry), rr)  # red
+
+        # Draw player position and facing (on top)
         p = self.dungeon.player
         px = offset_x + p.x * tile + tile // 2
         py = offset_y + p.y * tile + tile // 2
@@ -729,6 +760,134 @@ class EOBViewPG:
 
         # Blit to screen
         self.screen.blit(tiled, (min_x, min_y))
+
+    def _scale_surface(self, src: pygame.Surface, w: int, h: int) -> pygame.Surface:
+        w = max(1, w)
+        h = max(1, h)
+        if w == src.get_width() and h == src.get_height():
+            return src
+        try:
+            return pygame.transform.smoothscale(src, (w, h))
+        except Exception:
+            return pygame.transform.scale(src, (w, h))
+
+    # ----------------- Monsters (3D) -----------------
+    def _draw_monsters(self, layers: int) -> None:
+        if not getattr(self.dungeon, "monsters", None):
+            return
+        nearest = self._nearest_front if self._nearest_front is not None else None
+        for d in reversed(range(layers)):
+            # If a front wall is at or nearer than d, treat as occluder
+            if nearest is not None and d >= nearest:
+                continue
+            fx1, fy1, fx2, fy2 = self._front_rect(d)
+            band_w = max(1, fx2 - fx1)
+            band_h = max(1, fy2 - fy1)
+            # Target sprite size based on depth window
+            spr_h = int(band_h * 0.55)
+            spr_w = int(min(band_w * 0.30, spr_h * 0.9))
+            cx = (fx1 + fx2) // 2
+            left_cx = fx1 + band_w // 4
+            right_cx = fx2 - band_w // 4
+            for r_off, cxpos in ((-1, left_cx), (0, cx), (1, right_cx)):
+                wx, wy = self.dungeon.transform_local(d + 1, r_off)
+                if self.dungeon.is_wall(wx, wy):
+                    continue
+                # Find a monster at tile
+                mon = None
+                for m in self.dungeon.monsters:
+                    if m.x == wx and m.y == wy:
+                        mon = m
+                        break
+                if mon is None:
+                    continue
+                sprite = self._get_monster_sprite(mon.name)
+                alpha = 255
+                if self.fog_enabled:
+                    fog_b, fog_a = self._fog_params(d, layers)
+                    sprite = self._tint_surface(sprite, fog_b)
+                    alpha = int(255 * fog_a)
+                scaled = self._scale_surface(sprite, spr_w, spr_h)
+                scaled.set_alpha(max(0, min(255, alpha)))
+                x = int(cxpos - scaled.get_width() // 2)
+                y = int((fy1 + fy2) // 2 - scaled.get_height() // 2)
+                self.screen.blit(scaled, (x, y))
+
+    def _get_monster_sprite(self, name: str) -> pygame.Surface:
+        key = name.lower()
+        if "rat" in key:
+            return self.monster_sprites["rat"]
+        if "skeleton" in key:
+            return self.monster_sprites["skeleton"]
+        if "bat" in key:
+            return self.monster_sprites["bat"]
+        return self.monster_sprites.get("goblin")
+
+    def _gen_monster_sprites(self, sz: int) -> dict[str, pygame.Surface]:
+        sprites: dict[str, pygame.Surface] = {}
+        sprites["goblin"] = self._draw_face_sprite(sz, (36, 120, 52), eye=(250, 250, 255), mouth=(180, 40, 40))
+        sprites["skeleton"] = self._draw_skull_sprite(sz)
+        sprites["rat"] = self._draw_face_sprite(sz, (90, 90, 100), eye=(240, 80, 80), mouth=(60, 60, 70), ears=True)
+        sprites["bat"] = self._draw_bat_sprite(sz)
+        return sprites
+
+    def _draw_face_sprite(self, sz: int, base: tuple[int, int, int], *, eye: tuple[int, int, int], mouth: tuple[int, int, int], ears: bool = False) -> pygame.Surface:
+        s = pygame.Surface((sz, sz), pygame.SRCALPHA)
+        # Head
+        pygame.draw.ellipse(s, base, (int(sz*0.10), int(sz*0.18), int(sz*0.80), int(sz*0.70)))
+        # Ears
+        if ears:
+            pygame.draw.polygon(s, base, [(int(sz*0.20), int(sz*0.20)), (int(sz*0.10), int(sz*0.05)), (int(sz*0.30), int(sz*0.15))])
+            pygame.draw.polygon(s, base, [(int(sz*0.80), int(sz*0.20)), (int(sz*0.90), int(sz*0.05)), (int(sz*0.70), int(sz*0.15))])
+        # Eyes
+        eye_w, eye_h = int(sz*0.14), int(sz*0.16)
+        pygame.draw.ellipse(s, eye, (int(sz*0.28), int(sz*0.36), eye_w, eye_h))
+        pygame.draw.ellipse(s, eye, (int(sz*0.58), int(sz*0.36), eye_w, eye_h))
+        # Pupils
+        pygame.draw.circle(s, (10, 10, 14), (int(sz*0.28+eye_w*0.5), int(sz*0.36+eye_h*0.55)), max(1, sz//32))
+        pygame.draw.circle(s, (10, 10, 14), (int(sz*0.58+eye_w*0.5), int(sz*0.36+eye_h*0.55)), max(1, sz//32))
+        # Mouth
+        pygame.draw.ellipse(s, mouth, (int(sz*0.36), int(sz*0.62), int(sz*0.28), int(sz*0.12)))
+        # Teeth
+        for i in range(3):
+            x = int(sz*0.38 + i*sz*0.09)
+            pygame.draw.rect(s, (240, 240, 240), (x, int(sz*0.64), max(1, sz//28), int(sz*0.06)))
+        return s.convert_alpha()
+
+    def _draw_skull_sprite(self, sz: int) -> pygame.Surface:
+        s = pygame.Surface((sz, sz), pygame.SRCALPHA)
+        skull = (230, 230, 235)
+        dark = (40, 40, 44)
+        pygame.draw.ellipse(s, skull, (int(sz*0.15), int(sz*0.12), int(sz*0.70), int(sz*0.62)))
+        # Eyes
+        pygame.draw.ellipse(s, dark, (int(sz*0.30), int(sz*0.34), int(sz*0.14), int(sz*0.16)))
+        pygame.draw.ellipse(s, dark, (int(sz*0.56), int(sz*0.34), int(sz*0.14), int(sz*0.16)))
+        # Nose
+        pygame.draw.polygon(s, dark, [(int(sz*0.50), int(sz*0.50)), (int(sz*0.46), int(sz*0.60)), (int(sz*0.54), int(sz*0.60))])
+        # Teeth row
+        pygame.draw.rect(s, skull, (int(sz*0.26), int(sz*0.68), int(sz*0.48), int(sz*0.08)))
+        for i in range(6):
+            x = int(sz*0.28 + i*sz*0.07)
+            pygame.draw.line(s, dark, (x, int(sz*0.68)), (x, int(sz*0.76)), 1)
+        return s.convert_alpha()
+
+    def _draw_bat_sprite(self, sz: int) -> pygame.Surface:
+        s = pygame.Surface((sz, sz), pygame.SRCALPHA)
+        body = (110, 60, 140)
+        dark = (20, 12, 24)
+        # Body
+        pygame.draw.ellipse(s, body, (int(sz*0.40), int(sz*0.40), int(sz*0.20), int(sz*0.18)))
+        # Wings
+        pygame.draw.polygon(s, body, [(int(sz*0.50), int(sz*0.46)), (int(sz*0.20), int(sz*0.58)), (int(sz*0.10), int(sz*0.46))])
+        pygame.draw.polygon(s, body, [(int(sz*0.50), int(sz*0.46)), (int(sz*0.80), int(sz*0.58)), (int(sz*0.90), int(sz*0.46))])
+        # Head
+        pygame.draw.circle(s, body, (int(sz*0.50), int(sz*0.38)), max(2, sz//16))
+        # Eyes
+        pygame.draw.circle(s, (240, 240, 250), (int(sz*0.48), int(sz*0.38)), max(1, sz//40))
+        pygame.draw.circle(s, (240, 240, 250), (int(sz*0.52), int(sz*0.38)), max(1, sz//40))
+        # Outline hint
+        pygame.draw.ellipse(s, dark, (int(sz*0.40), int(sz*0.40), int(sz*0.20), int(sz*0.18)), 1)
+        return s.convert_alpha()
 
     def _process_hold(self, dt: float) -> None:
         if self.menu_open or self.map_open:

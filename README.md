@@ -26,7 +26,9 @@ This project uses pyenv to pin a Python version and a local virtualenv via the M
 
 - Movement: arrows or WASD to turn/move; `Q` quits.
 - View: layered wall slices draw front and side walls for 4 depths.
-- Map: simple built-in dungeon; walls are impassable.
+- Map: press `M` to toggle a top-down map. It shows walls (gray), visited floors (light), unseen (dark), you (yellow), monsters (red), gold (yellow squares), and weapons (blue squares).
+- Entities: monsters roam the dungeon; stepping toward a monster triggers simple combat. Pick up gold by stepping onto it. Weapons improve your attack when equipped automatically if better than current.
+ - Monsters now render in the 3D corridor as simple billboard sprites with distance fog.
 
 ## Project Structure
 
