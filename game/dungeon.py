@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List
+import json
+
 
 
 Tile = int  # 0=floor, 1=wall
@@ -45,6 +47,37 @@ class Dungeon:
         self.grid = grid if grid is not None else default_map()
         # Place player in a walkable cell facing north
         self.player = PlayerState(x=2, y=2, facing=1)
+
+    # --- Persistence ---
+    def to_dict(self) -> dict:
+        return {
+            "grid": self.grid,
+            "player": {
+                "x": self.player.x,
+                "y": self.player.y,
+                "facing": self.player.facing,
+            },
+        }
+
+    def load_dict(self, data: dict) -> None:
+        grid = data.get("grid")
+        player = data.get("player", {})
+        if isinstance(grid, list):
+            self.grid = grid  # type: ignore[assignment]
+        self.player = PlayerState(
+            x=int(player.get("x", self.player.x)),
+            y=int(player.get("y", self.player.y)),
+            facing=int(player.get("facing", self.player.facing)),
+        )
+
+    def save_to_file(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f)
+
+    def load_from_file(self, path: str) -> None:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.load_dict(data)
 
     # --- Queries ---
     def is_wall(self, x: int, y: int) -> bool:
@@ -93,4 +126,3 @@ class Dungeon:
             return (px - right, py + forward)
         # W
         return (px - forward, py - right)
-
